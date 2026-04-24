@@ -208,6 +208,7 @@ var allTests = integration.TestFuncs(
 	testHistoryFinalizeTrace,
 	testEmptyStages,
 	testLocalCustomSessionID,
+	testSharedSessionDedupesContextOp,
 	testTargetStageNameArg,
 	testStepNames,
 	testDefaultPathEnvOnWindows,
@@ -8327,6 +8328,119 @@ COPY --from=base /another /out2
 	dt, err = os.ReadFile(filepath.Join(destDir, "out2"))
 	require.NoError(t, err)
 	require.Equal(t, "contents2", string(dt))
+}
+
+// testSharedSessionDedupesContextOp covers the bake parallel-solve cache
+// duplication scenario from frontend/dockerui: two concurrent solves over
+// the same build context, using a shared session id wired up via
+// "local-sessionid:context", but with different --target values that touch
+// disjoint context files. Without the FollowPaths-stripping fix in
+// frontend/dockerui MainContext, each solve emits a distinct llb.Local op
+// (per-target FollowPaths in its digest), so the solver cannot merge the
+// cold, in-flight source work and shared ancestor RUN steps duplicate
+// across the two solves. After the fix the two ops are byte-identical and
+// the solver deduplicates the parent vertex, so the parent's RUN is
+// executed once and both solves observe the same output.
+func testSharedSessionDedupesContextOp(t *testing.T, sb integration.Sandbox) {
+	ctx := sb.Context()
+
+	c, err := client.New(ctx, sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	// `parent` bind-mounts only file-A from the context and stamps a unique
+	// random value; `child` extends parent and also bind-mounts file-B. The
+	// two targets therefore have divergent ctxPaths (A vs A+B), and pre-fix
+	// the dockerfile frontend would emit different llb.Local ops per target.
+	dockerfile := []byte(`
+FROM busybox AS parent
+RUN --mount=type=bind,source=file-a,target=/file-a \
+    head -c 16 /dev/urandom | base64 > /stamp && \
+    cat /file-a > /seen-a
+
+FROM parent AS child
+RUN --mount=type=bind,source=file-b,target=/file-b \
+    cat /file-b > /seen-b
+`)
+
+	dfDir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+	ctxDir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("file-a", []byte("A-contents"), 0600),
+		fstest.CreateFile("file-b", []byte("B-contents"), 0600),
+	)
+
+	dirs := filesync.NewFSSyncProvider(filesync.StaticDirSource{
+		dockerui.DefaultLocalNameDockerfile: dfDir,
+		dockerui.DefaultLocalNameContext:    ctxDir,
+	})
+
+	s, err := session.NewSession(ctx, "shared-context-hint")
+	require.NoError(t, err)
+	s.Allow(dirs)
+	go func() {
+		err := s.Run(ctx, c.Dialer())
+		assert.NoError(t, err)
+	}()
+
+	f := getFrontend(t, sb)
+
+	parentDir := t.TempDir()
+	childDir := t.TempDir()
+
+	mkOpt := func(target, outDir string) client.SolveOpt {
+		return client.SolveOpt{
+			FrontendAttrs: map[string]string{
+				"target": target,
+				"local-sessionid:" + dockerui.DefaultLocalNameDockerfile: s.ID(),
+				"local-sessionid:" + dockerui.DefaultLocalNameContext:    s.ID(),
+			},
+			Exports: []client.ExportEntry{
+				{Type: client.ExporterLocal, OutputDir: outDir},
+			},
+		}
+	}
+
+	// Issue both solves concurrently against the same shared session.
+	eg, egCtx := errgroup.WithContext(ctx)
+	eg.Go(func() error {
+		_, err := f.Solve(egCtx, c, mkOpt("parent", parentDir), nil)
+		return err
+	})
+	eg.Go(func() error {
+		_, err := f.Solve(egCtx, c, mkOpt("child", childDir), nil)
+		return err
+	})
+	require.NoError(t, eg.Wait())
+
+	// Both targets must have observed file-A correctly, demonstrating the
+	// shared-session sync served both consumers (file-A is in both ctxPaths,
+	// file-B only in child's).
+	dt, err := os.ReadFile(filepath.Join(parentDir, "seen-a"))
+	require.NoError(t, err)
+	require.Equal(t, "A-contents", string(dt))
+	dt, err = os.ReadFile(filepath.Join(childDir, "seen-a"))
+	require.NoError(t, err)
+	require.Equal(t, "A-contents", string(dt))
+	dt, err = os.ReadFile(filepath.Join(childDir, "seen-b"))
+	require.NoError(t, err)
+	require.Equal(t, "B-contents", string(dt))
+
+	// The key assertion: parent's RUN generates a unique random stamp on
+	// every execution. If both solves share the parent vertex (i.e. the
+	// fix unifies their llb.Local ops), the RUN runs once and both exports
+	// expose the same stamp. Pre-fix the parent vertex was distinct per
+	// target, the RUN ran twice, and the two stamps would differ.
+	parentStamp, err := os.ReadFile(filepath.Join(parentDir, "stamp"))
+	require.NoError(t, err)
+	childStamp, err := os.ReadFile(filepath.Join(childDir, "stamp"))
+	require.NoError(t, err)
+	require.NotEmpty(t, parentStamp)
+	require.Equal(t, string(parentStamp), string(childStamp),
+		"shared parent RUN should execute once across concurrent target=parent and target=child solves")
 }
 
 func testNamedOCILayoutContext(t *testing.T, sb integration.Sandbox) {

@@ -435,20 +435,40 @@ func (bc *Client) MainContext(ctx context.Context, opts ...llb.LocalOption) (*ll
 	}
 
 	sessionID := bc.bopts.SessionID
-	if v, ok := bc.localsSessionIDs[bctx.contextLocalName]; ok {
-		sessionID = v
+	sharedSessionID, sharedSession := bc.localsSessionIDs[bctx.contextLocalName]
+	if sharedSession {
+		sessionID = sharedSessionID
 	}
 
-	opts = append([]llb.LocalOption{
-		llb.SessionID(sessionID),
-		llb.ExcludePatterns(excludes),
-		llb.SharedKeyHint(bctx.contextLocalName),
-		WithInternalName("load build context"),
-	}, opts...)
-
+	opts = mainContextLocalOpts(bctx.contextLocalName, sessionID, excludes, opts, sharedSession)
 	st := llb.Local(bctx.contextLocalName, opts...)
 
 	return &st, nil
+}
+
+// mainContextLocalOpts builds the llb.LocalOption list for the build context.
+//
+// When the context local is resolved through a shared session (buildx's
+// detectSharedMounts wired one up for us because multiple top-level bake
+// targets use the same context), any per-target FollowPaths the caller
+// supplied is overridden with an empty value. Per-target FollowPaths makes
+// each concurrent solve's llb.Local op digest distinct, so the solver cannot
+// merge the local source vertex while the solves are in flight. Dropping
+// FollowPaths lets all concurrent solves produce a single shared source vertex
+// and dedupe the ancestor work, at the cost of syncing the full context once
+// instead of per-target subsets.
+func mainContextLocalOpts(name, sessionID string, excludes []string, callerOpts []llb.LocalOption, sharedSession bool) []llb.LocalOption {
+	opts := []llb.LocalOption{
+		llb.SessionID(sessionID),
+		llb.ExcludePatterns(excludes),
+		llb.SharedKeyHint(name),
+		WithInternalName("load build context"),
+	}
+	opts = append(opts, callerOpts...)
+	if sharedSession {
+		opts = append(opts, llb.FollowPaths(nil))
+	}
+	return opts
 }
 
 func (bc *Client) NamedContext(name string, opt ContextOpt) (*NamedContext, error) {
