@@ -372,7 +372,44 @@ func (cu *cacheUpdater) ContentHasher() fsutil.ContentHasher {
 const (
 	keySharedKey   = "local.sharedKey"
 	sharedKeyIndex = keySharedKey + ":"
+
+	// keySyncedPaths records the JSON-encoded set of context paths a
+	// ref has fetched so far. Refs without this key are treated as
+	// "paths unknown" and never match a request as superset, falling
+	// through to a full sync. See pathSet for the value semantics.
+	keySyncedPaths = "local.syncedPaths"
 )
+
+// syncedPathsRecord is the on-disk JSON shape for a pathSet stored in
+// ref metadata. We persist Full as a separate flag rather than trying to
+// encode it as a sentinel path, so an empty Paths slice unambiguously
+// means "no paths" (not "everything").
+type syncedPathsRecord struct {
+	Full  bool     `json:"full,omitempty"`
+	Paths []string `json:"paths,omitempty"`
+}
+
+func encodeSyncedPaths(ps pathSet) (string, error) {
+	dt, err := json.Marshal(syncedPathsRecord{Full: ps.full, Paths: ps.paths})
+	if err != nil {
+		return "", err
+	}
+	return string(dt), nil
+}
+
+func decodeSyncedPaths(s string) (pathSet, error) {
+	var r syncedPathsRecord
+	if err := json.Unmarshal([]byte(s), &r); err != nil {
+		return pathSet{}, err
+	}
+	if r.Full {
+		return pathSet{full: true}, nil
+	}
+	if len(r.Paths) == 0 {
+		return pathSet{}, nil
+	}
+	return canonicalPaths(r.Paths), nil
+}
 
 func searchSharedKey(ctx context.Context, store cache.MetadataStore, k string) ([]cacheRefMetadata, error) {
 	var results []cacheRefMetadata
@@ -396,4 +433,28 @@ func (md cacheRefMetadata) getSharedKey() string {
 
 func (md cacheRefMetadata) setSharedKey(key string) error {
 	return md.SetString(keySharedKey, key, sharedKeyIndex+key)
+}
+
+// getSyncedPaths returns the path set this ref has already fetched. The
+// second return value is false when the ref carries no syncedPaths
+// metadata (e.g. legacy on-disk refs from before this metadata existed).
+// Callers must treat an absent record as "unknown" — never as "full".
+func (md cacheRefMetadata) getSyncedPaths() (pathSet, bool, error) {
+	s := md.GetString(keySyncedPaths)
+	if s == "" {
+		return pathSet{}, false, nil
+	}
+	ps, err := decodeSyncedPaths(s)
+	if err != nil {
+		return pathSet{}, false, err
+	}
+	return ps, true, nil
+}
+
+func (md cacheRefMetadata) setSyncedPaths(ps pathSet) error {
+	enc, err := encodeSyncedPaths(ps)
+	if err != nil {
+		return err
+	}
+	return md.SetString(keySyncedPaths, enc, "")
 }
