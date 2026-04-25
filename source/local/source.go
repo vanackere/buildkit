@@ -208,11 +208,43 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 	}
 	sharedKey := ls.src.Name + ":" + ls.src.SharedKeyHint + ":" + caller.SharedKey() + metaSfx // TODO: replace caller.SharedKey() with source based hint from client(absolute-path+nodeid)
 
-	var mutable cache.MutableRef
+	requested := canonicalPaths(ls.src.FollowPaths)
+
 	sis, err := searchSharedKey(ctx, ls.cm, sharedKey)
 	if err != nil {
 		return nil, err
 	}
+
+	// Pass 1: reuse an existing immutable whose recorded synced-path
+	// set already covers what this caller needs. The shared-key index
+	// already groups refs that share session/name/include/exclude
+	// (FollowPaths is not part of it), so a later solve whose request
+	// is a subset of an earlier solve's synced paths can short-circuit
+	// straight to the earlier solve's immutable — no FSSync round-trip,
+	// no fresh commit.
+	for _, si := range sis {
+		have, ok, err := si.getSyncedPaths()
+		if err != nil {
+			return nil, err
+		}
+		if !ok || !have.covers(requested) {
+			continue
+		}
+		ref, err := ls.cm.Get(ctx, si.ID(), nil)
+		if err != nil {
+			// Either si is the mutable (Get rejects mutable refs) or
+			// the immutable has been GC'd. Fall through; the second
+			// pass below will pick up the mutable if there is one.
+			bklog.G(ctx).Debugf("not reusing immutable %s for local: %v", si.ID(), err)
+			continue
+		}
+		bklog.G(ctx).Debugf("reusing immutable %s for local", ref.ID())
+		return ref, nil
+	}
+
+	// Pass 2: no immutable covers the request. Find the mutable for
+	// this shared key (if any) and extend it with the missing paths.
+	var mutable cache.MutableRef
 	for _, si := range sis {
 		if m, err := ls.cm.GetMutable(ctx, si.ID()); err == nil {
 			bklog.G(ctx).Debugf("reusing ref for local: %s", m.ID())
@@ -223,6 +255,9 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		}
 	}
 
+	var muHave pathSet
+	muHaveKnown := false
+
 	if mutable == nil {
 		m, err := ls.cm.New(ctx, nil, nil, cache.CachePolicyRetain, cache.WithRecordType(client.UsageRecordTypeLocalSource), cache.WithDescription(fmt.Sprintf("local source for %s", ls.src.Name)))
 		if err != nil {
@@ -230,6 +265,14 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		}
 		mutable = m
 		bklog.G(ctx).Debugf("new ref for local: %s", mutable.ID())
+		// A freshly minted mutable has nothing fetched yet; that's a
+		// known-empty pathSet, not unknown.
+		muHaveKnown = true
+	} else {
+		muHave, muHaveKnown, err = cacheRefMetadata{mutable}.getSyncedPaths()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	defer func() {
@@ -243,17 +286,39 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		}
 	}()
 
-	if err := ls.syncInto(ctx, caller, mutable, ls.src.FollowPaths); err != nil {
-		return nil, err
+	// Decide what to actually transfer. For a legacy mutable with no
+	// syncedPaths metadata we can't tell what's already there, so we
+	// fall back to a full sync — no worse than the pre-fix behavior.
+	var toSync pathSet
+	if !muHaveKnown {
+		toSync = pathSet{full: true}
+	} else {
+		toSync = muHave.missing(requested)
 	}
 
-	// skip storing snapshot by the shared key if it already exists
+	if !toSync.empty() {
+		if err := ls.syncInto(ctx, caller, mutable, toSync.followPaths()); err != nil {
+			return nil, err
+		}
+	}
+
+	// Compute the path set the mutable now covers.
+	var newHave pathSet
+	if !muHaveKnown {
+		newHave = pathSet{full: true}
+	} else {
+		newHave = muHave.union(requested)
+	}
+
 	md := cacheRefMetadata{mutable}
 	if md.getSharedKey() != sharedKey {
 		if err := md.setSharedKey(sharedKey); err != nil {
 			return nil, err
 		}
 		bklog.G(ctx).Debugf("saved %s as %s", mutable.ID(), sharedKey)
+	}
+	if err := md.setSyncedPaths(newHave); err != nil {
+		return nil, err
 	}
 
 	snap, err := mutable.Commit(ctx)
@@ -262,6 +327,16 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 	}
 
 	mutable = nil // avoid deferred cleanup
+
+	// Register the new immutable under the shared-key index with its
+	// path set so the next caller's pass-1 search can reuse it.
+	imd := cacheRefMetadata{snap}
+	if err := imd.setSharedKey(sharedKey); err != nil {
+		return nil, err
+	}
+	if err := imd.setSyncedPaths(newHave); err != nil {
+		return nil, err
+	}
 
 	return snap, nil
 }
