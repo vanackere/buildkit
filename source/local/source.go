@@ -243,74 +243,7 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 		}
 	}()
 
-	mount, err := mutable.Mount(ctx, false, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	lm := snapshot.LocalMounter(mount)
-
-	dest, err := lm.Mount()
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() {
-		if retErr != nil && lm != nil {
-			lm.Unmount()
-		}
-	}()
-
-	cc, err := contenthash.GetCacheContext(ctx, mutable)
-	if err != nil {
-		return nil, err
-	}
-
-	opt := filesync.FSSendRequestOpt{
-		Name:            ls.src.Name,
-		IncludePatterns: ls.src.IncludePatterns,
-		ExcludePatterns: ls.src.ExcludePatterns,
-		FollowPaths:     ls.src.FollowPaths,
-		DestDir:         dest,
-		CacheUpdater:    &cacheUpdater{cc, mount.IdentityMapping()},
-		ProgressCb:      newProgressHandler(ctx, "transferring "+ls.src.Name+":"),
-		Differ:          ls.src.Differ,
-		MetadataOnly:    ls.src.MetadataOnly,
-	}
-
-	if opt.MetadataOnly && len(ls.src.MetadataExceptions) > 0 {
-		matcher, err := patternmatcher.New(ls.src.MetadataExceptions)
-		if err != nil {
-			return nil, errors.WithStack(err)
-		}
-		opt.MetadataOnlyFilter = func(p string, _ *fstypes.Stat) bool {
-			v, err := matcher.MatchesOrParentMatches(p)
-			return err == nil && v
-		}
-	}
-
-	if idmap := mount.IdentityMapping(); idmap != nil {
-		opt.Filter = func(p string, stat *fstypes.Stat) bool {
-			uid, gid, err := idmap.ToHost(int(stat.Uid), int(stat.Gid))
-			if err != nil {
-				return false
-			}
-			stat.Uid = uint32(uid)
-			stat.Gid = uint32(gid)
-			return true
-		}
-	}
-
-	if err := filesync.FSSync(ctx, caller, opt); err != nil {
-		return nil, err
-	}
-
-	if err := lm.Unmount(); err != nil {
-		return nil, err
-	}
-	lm = nil
-
-	if err := contenthash.SetCacheContext(ctx, mutable, cc); err != nil {
+	if err := ls.syncInto(ctx, caller, mutable, ls.src.FollowPaths); err != nil {
 		return nil, err
 	}
 
@@ -331,6 +264,81 @@ func (ls *localSourceHandler) snapshot(ctx context.Context, caller session.Calle
 	mutable = nil // avoid deferred cleanup
 
 	return snap, nil
+}
+
+// syncInto mounts mutable and runs an FSSync against it for the given
+// FollowPaths. On a successful sync the contenthash cache for the
+// mutable is updated; on any error along the way the mount is unmounted
+// and the caller is expected to release/reset the mutable.
+func (ls *localSourceHandler) syncInto(ctx context.Context, caller session.Caller, mutable cache.MutableRef, followPaths []string) (retErr error) {
+	mount, err := mutable.Mount(ctx, false, nil)
+	if err != nil {
+		return err
+	}
+
+	lm := snapshot.LocalMounter(mount)
+
+	dest, err := lm.Mount()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if retErr != nil && lm != nil {
+			lm.Unmount()
+		}
+	}()
+
+	cc, err := contenthash.GetCacheContext(ctx, mutable)
+	if err != nil {
+		return err
+	}
+
+	opt := filesync.FSSendRequestOpt{
+		Name:            ls.src.Name,
+		IncludePatterns: ls.src.IncludePatterns,
+		ExcludePatterns: ls.src.ExcludePatterns,
+		FollowPaths:     followPaths,
+		DestDir:         dest,
+		CacheUpdater:    &cacheUpdater{cc, mount.IdentityMapping()},
+		ProgressCb:      newProgressHandler(ctx, "transferring "+ls.src.Name+":"),
+		Differ:          ls.src.Differ,
+		MetadataOnly:    ls.src.MetadataOnly,
+	}
+
+	if opt.MetadataOnly && len(ls.src.MetadataExceptions) > 0 {
+		matcher, err := patternmatcher.New(ls.src.MetadataExceptions)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		opt.MetadataOnlyFilter = func(p string, _ *fstypes.Stat) bool {
+			v, err := matcher.MatchesOrParentMatches(p)
+			return err == nil && v
+		}
+	}
+
+	if idmap := mount.IdentityMapping(); idmap != nil {
+		opt.Filter = func(p string, stat *fstypes.Stat) bool {
+			uid, gid, err := idmap.ToHost(int(stat.Uid), int(stat.Gid))
+			if err != nil {
+				return false
+			}
+			stat.Uid = uint32(uid)
+			stat.Gid = uint32(gid)
+			return true
+		}
+	}
+
+	if err := filesync.FSSync(ctx, caller, opt); err != nil {
+		return err
+	}
+
+	if err := lm.Unmount(); err != nil {
+		return err
+	}
+	lm = nil
+
+	return contenthash.SetCacheContext(ctx, mutable, cc)
 }
 
 func newProgressHandler(ctx context.Context, id string) func(int, bool) {
